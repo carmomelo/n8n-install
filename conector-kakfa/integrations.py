@@ -1,12 +1,15 @@
 import json, sys, time, requests
 from typing import Any, Dict, Optional
+from requests.auth import HTTPBasicAuth
+from urllib3.exceptions import InsecureRequestWarning
+import urllib3
 from . import config
+if not config.WH_VERIFY_SSL:
+    urllib3.disable_warnings(InsecureRequestWarning)
 
-def post_webhook_with_retry(payload: Dict[str, Any]) -> int:
-    """POST no webhook do n8n com retry/backoff. Retorna status_code (2xx = sucesso)."""
-    if not config.WEBHOOK_URL:
-        raise RuntimeError("WEBHOOK_URL não configurado")
 
+def _build_webhook_headers() -> Dict[str, str]:
+    """Monta os headers do webhook. Dá prioridade a WH_AUTH_HDR se vier pronto."""
     headers = {"Content-Type": "application/json"}
     if config.WH_AUTH_HDR:
         try:
@@ -14,6 +17,30 @@ def post_webhook_with_retry(payload: Dict[str, Any]) -> int:
             headers[k.strip()] = v.strip()
         except Exception:
             sys.stderr.write("[Webhook] WEBHOOK_AUTH_HEADER inválido; use 'Nome: valor'\n")
+    return headers
+
+
+def _build_webhook_auth() -> Optional[HTTPBasicAuth]:
+    """
+    Retorna um HTTPBasicAuth se WEBHOOK_BASIC_USER/PASS estiverem definidos.
+    Se WH_AUTH_HDR foi passado, não usamos 'auth' (deixamos só o header explícito).
+    """
+    if config.WH_AUTH_HDR:
+        return None
+    user = getattr(config, "WEBHOOK_BASIC_USER", "") or ""
+    pwd  = getattr(config, "WEBHOOK_BASIC_PASS", "") or ""
+    if user and pwd:
+        return HTTPBasicAuth(user, pwd)
+    return None
+
+
+def post_webhook_with_retry(payload: Dict[str, Any]) -> int:
+    """POST no webhook do n8n com retry/backoff. Retorna status_code (2xx = sucesso)."""
+    if not config.WEBHOOK_URL:
+        raise RuntimeError("WEBHOOK_URL não configurado")
+
+    headers = _build_webhook_headers()
+    auth = _build_webhook_auth()
 
     attempt, backoff, last_exc = 0, config.WH_BACKOFF, None
     while attempt < config.WH_RETRIES:
@@ -25,19 +52,31 @@ def post_webhook_with_retry(payload: Dict[str, Any]) -> int:
                 timeout=config.WH_TIMEOUT,
                 verify=config.WH_VERIFY_SSL,
                 headers=headers,
+                auth=auth,
             )
             if 200 <= r.status_code < 300:
                 return r.status_code
+
+            # Log mais informativo para 401/403
+            if r.status_code in (401, 403):
+                used_auth = "BasicAuth" if auth else ("CustomHeader" if config.WH_AUTH_HDR else "None")
+                sys.stderr.write(
+                    f"[Webhook] HTTP {r.status_code} (auth={used_auth}). Corpo: {r.text[:300]}\n"
+                )
             else:
                 sys.stderr.write(f"[Webhook] HTTP {r.status_code}: {r.text[:300]}\n")
+
         except Exception as e:
             last_exc = e
             sys.stderr.write(f"[Webhook] erro no POST ({attempt}/{config.WH_RETRIES}): {e}\n")
+
         time.sleep(backoff)
         backoff *= 2.0
+
     if last_exc:
         raise last_exc
     raise RuntimeError("Falha no POST do webhook (sem exceção explícita)")
+
 
 def custom_failure_log(context: Dict[str, Any]) -> None:
     """
@@ -107,8 +146,13 @@ VALUES (
     }
 
     try:
-        resp = requests.post(config.DB_SQL_URL, headers=headers, data=json.dumps(body),
-                             verify=config.DB_VERIFY_SSL, timeout=30)
+        resp = requests.post(
+            config.DB_SQL_URL,
+            headers=headers,
+            data=json.dumps(body),
+            verify=config.DB_VERIFY_SSL,
+            timeout=30
+        )
         if not (200 <= resp.status_code < 300):
             sys.stderr.write(f"[FailureLog] HTTP {resp.status_code}: {resp.text[:500]}\n")
             return
